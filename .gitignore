@@ -1,0 +1,10 @@
+.env
+*.zip
+.env.*
+!.env.example
+*.log
+__pycache__/
+*.pyc
+max_users.json
+max_webhook_events.log
+max_webhook_errors.log
