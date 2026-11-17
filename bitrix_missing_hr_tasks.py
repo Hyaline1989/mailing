@@ -6,6 +6,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+EXCLUDED_DEAL_IDS = {48445}
 
 
 def load_dotenv(path: Path) -> None:
@@ -118,14 +120,41 @@ class BitrixClient:
         return items
 
 
+def split_message(text: str, limit: int = 3500) -> list[str]:
+    parts: list[str] = []
+    while len(text) > limit:
+        end = text.rfind("\n", 0, limit + 1)
+        if end <= 0:
+            end = limit
+        else:
+            end += 1
+        if end > limit:
+            end = limit
+        parts.append(text[:end])
+        text = text[end:]
+    if text:
+        parts.append(text)
+    return parts
+
+
 class MaxClient:
     def __init__(self, token: str) -> None:
         self.token = token
 
     def send_message(self, user_id: str, text: str) -> None:
-        query = urllib.parse.urlencode({"user_id": user_id})
+        parts = split_message(text)
+        for index, part in enumerate(parts, start=1):
+            try:
+                self._send_part(user_id, part)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"MAX, получатель {user_id}: подтверждено частей {index - 1}/{len(parts)}; {exc}"
+                ) from exc
+
+    def _send_part(self, user_id: str, text: str) -> None:
+        query = urllib.parse.urlencode({"user_id": user_id, "disable_link_preview": "true"})
         url = f"https://platform-api2.max.ru/messages?{query}"
-        payload = json.dumps({"text": text, "disable_link_preview": True}).encode("utf-8")
+        payload = json.dumps({"text": text}).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=payload,
@@ -136,8 +165,13 @@ class MaxClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            response.read()
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:800]
+            detail = detail.replace(self.token, "[token]") if self.token else detail
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
     def get_updates(
         self,
@@ -367,9 +401,8 @@ def send_admin_report(
     print("Админский отчёт отправлен.")
 
 
-def send_notifications(missing: list[dict[str, Any]], checked_count: int) -> None:
-    token = require_env("MAX_BOT_TOKEN")
-    recipients = {
+def notification_recipients() -> dict[str, list[str]]:
+    return {
         "andrey": [os.getenv("MAX_ANDREY_USER_ID", "").strip()],
         "ivan": [os.getenv("MAX_IVAN_USER_ID", "").strip()],
         "husan_aleksey": [
@@ -377,7 +410,68 @@ def send_notifications(missing: list[dict[str, Any]], checked_count: int) -> Non
             os.getenv("MAX_ALEKSEY_USER_ID", "").strip(),
         ],
     }
-    max_client = MaxClient(token)
+def history_path() -> Path:
+    return Path(os.getenv("MAILING_HISTORY_PATH", str(ROOT / "notification_history.json")))
+
+
+def read_history() -> dict[str, list[str]]:
+    path = history_path()
+    if not path.exists():
+        raise RuntimeError("Нет истории отправок. Сначала выполните --audit --baseline-current.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("sent"), dict):
+        raise RuntimeError("Некорректная история отправок. Рассылка остановлена.")
+    if any(not isinstance(v, list) or any(not isinstance(i, str) for i in v) for v in data["sent"].values()):
+        raise RuntimeError("Некорректные записи истории отправок.")
+    return data["sent"]
+
+
+def save_history(sent: dict[str, list[str]]) -> None:
+    path = history_path()
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump({"version": 1, "sent": sent}, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def baseline_current(missing: list[dict[str, Any]]) -> None:
+    if history_path().exists():
+        raise RuntimeError("История уже существует. Повторная инициализация запрещена.")
+    recipients = notification_recipients()
+    sent: dict[str, list[str]] = {}
+    for item in missing:
+        users = recipients.get(item["notify_to"], [])
+        if not users or any(not user for user in users):
+            raise RuntimeError(f"Не определены все получатели сделки {item['deal_id']}. История не создана.")
+        for user in users:
+            deal_id = str(item["deal_id"])
+            if deal_id not in sent.setdefault(user, []):
+                sent[user].append(deal_id)
+    save_history(sent)
+    print(f"История создана: {len(missing)} текущих сделок отмечены как отправленные. Сообщения не отправлялись.")
+
+
+def notification_batches(owner: str, items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    batch: list[dict[str, Any]] = []
+    for item in items:
+        if len(format_alert_message(owner, [item])) > 3500:
+            raise RuntimeError(f"Слишком длинные данные сделки {item['deal_id']}")
+        if batch and len(format_alert_message(owner, batch + [item])) > 3500:
+            batches.append(batch)
+            batch = []
+        batch.append(item)
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def send_notifications(missing: list[dict[str, Any]], checked_count: int) -> None:
+    sent = read_history()
+    recipients = notification_recipients()
+    max_client = MaxClient(require_env("MAX_BOT_TOKEN"))
     delivery_status: list[str] = []
 
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -399,10 +493,25 @@ def send_notifications(missing: list[dict[str, Any]], checked_count: int) -> Non
             print(message)
             continue
         for recipient in filled_recipients:
-            max_client.send_message(recipient, format_alert_message(owner, items))
-        message = f"{owner}: отправлено, {len(items)} сделок"
-        delivery_status.append(message)
-        print(message)
+            previous = set(sent.get(recipient, []))
+            new_items = [item for item in items if str(item["deal_id"]) not in previous]
+            delivered = 0
+            error = ""
+            for batch in notification_batches(owner, new_items):
+                try:
+                    max_client.send_message(recipient, format_alert_message(owner, batch))
+                except Exception as exc:
+                    error = str(exc)
+                    break
+                sent.setdefault(recipient, []).extend(str(item["deal_id"]) for item in batch)
+                # Persist each confirmed batch before attempting another delivery.
+                save_history(sent)
+                delivered += len(batch)
+            message = f"{owner} ({recipient}): новых отправлено {delivered}, ранее отправлено {len(items) - len(new_items)}"
+            if error:
+                message += f"; ошибка отправки: {error}"
+            delivery_status.append(message)
+            print(message, flush=True)
 
     send_admin_report(max_client, checked_count, missing, delivery_status)
 
@@ -490,6 +599,7 @@ def audit_missing_tasks(
     max_deals: int | None = None,
     notify: bool = False,
     created_since: str | None = None,
+    baseline: bool = False,
 ) -> None:
     settlement_field = require_env("SETTLEMENT_DATE_FIELD")
     project_field = require_env("PROJECT_FIELD")
@@ -523,6 +633,8 @@ def audit_missing_tasks(
         if str(deal.get("SOURCE_ID") or "").strip() in excluded_source_ids:
             continue
         deal_id = int(deal["ID"])
+        if deal_id in EXCLUDED_DEAL_IDS:
+            continue
         settlement_date = parse_bitrix_date(deal.get(settlement_field))
         if not settlement_date or settlement_date > cutoff:
             continue
@@ -544,6 +656,10 @@ def audit_missing_tasks(
                 "notify_to": find_object_owner(project_id, project, object_owners),
             }
         )
+
+    if baseline:
+        baseline_current(missing)
+        return
 
     if not missing:
         print("Проблемных сделок не найдено.")
@@ -568,7 +684,7 @@ def audit_missing_tasks(
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
         sys.stderr.reconfigure(encoding="utf-8")
 
     load_dotenv(ROOT / ".env")
@@ -582,9 +698,12 @@ def main() -> None:
     parser.add_argument("--max-deals", type=int, help="Ограничить количество сделок для тестового аудита")
     parser.add_argument("--created-since", help="Проверять только сделки, созданные с даты YYYY-MM-DD")
     parser.add_argument("--notify", action="store_true", help="Отправить найденные сделки в MAX")
+    parser.add_argument("--baseline-current", action="store_true", help="Отметить текущие сделки как отправленные, без сообщений")
     parser.add_argument("--max-updates", action="store_true", help="Показать user_id людей, которые пишут MAX-боту")
     parser.add_argument("--watch-seconds", type=int, help="Сколько секунд ждать новые MAX-сообщения")
     args = parser.parse_args()
+    if args.baseline_current and (not args.audit or args.notify or args.max_deals is not None):
+        parser.error("--baseline-current требует --audit и несовместим с --notify и --max-deals")
 
     client = BitrixClient(require_env("BITRIX_WEBHOOK_URL"))
 
@@ -598,7 +717,7 @@ def main() -> None:
         return
 
     if args.audit:
-        audit_missing_tasks(client, args.max_deals, args.notify, args.created_since)
+        audit_missing_tasks(client, args.max_deals, args.notify, args.created_since, args.baseline_current)
         return
 
     if args.max_updates:

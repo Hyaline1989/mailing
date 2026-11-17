@@ -1,4 +1,6 @@
 .env
+notification_history.json
+notification_history.tmp
 *.zip
 .env.*
 !.env.example

@@ -31,7 +31,7 @@ class SourceFilterTests(unittest.TestCase):
             [
                 {"ID": str(i), "TITLE": "Test", "SETTLED": "2020-01-01", "SOURCE_ID": source}
                 for i, source in enumerate(["RETURN", "WEB", None], start=1)
-            ],
+            ] + [{"ID": "48445", "TITLE": "Excluded", "SETTLED": "2020-01-01", "SOURCE_ID": "WEB"}],
         ]
         env = {"SETTLEMENT_DATE_FIELD": "SETTLED", "PROJECT_FIELD": "PROJECT", "HR_RESPONSIBLE_IDS": "4683,69625", "OLDER_THAN_DAYS": "5"}
         with patch.dict(os.environ, env, clear=True), patch.object(app, "task_exists_for_deal", return_value=False) as tasks, patch.object(app, "send_notifications") as send, contextlib.redirect_stdout(io.StringIO()):
